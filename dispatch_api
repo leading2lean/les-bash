@@ -1,0 +1,298 @@
+#!/bin/bash
+
+# This is an bash script (using curl) for how to use the L2L Dispatch API to read and write data in the Dispatch system.
+# The script was written using version 7.64.1 of curl. The jq tool is used to parse data from the JSON responses
+# (https://stedolan.github.io/jq/).
+#
+# To run this code, you would then run:
+#    $ bash dipsatch_api -v <your_server>.leading2lean.com <site> <username> <apikey>
+
+# This example has you pass your API key in on the command line. The API Key MUST be kept secret, and effective
+# secrets management is outside the scope of this example. Make sure you don't hard code your api key into your
+# source code, and usually you should expose it to your production code through an environment variable.
+
+show_help() {
+  cat <<EOF
+Usage: ${0##*/} <server> <site> <username> <apikey>
+    -v          output debugging information
+EOF
+}
+
+VERBOSE=false
+OPTIND=1
+while getopts ":v" opt; do
+  case $opt in
+  v)
+    VERBOSE=true
+    ;;
+  *)
+    show_help >&2
+    exit 1
+    ;;
+  esac
+done
+shift "$((OPTIND - 1))" # Discard the options and sentinel --
+
+SERVER=$1
+SITE=$2
+USERNAME=$3
+API_KEY=$4
+BASE_URL=https://${SERVER}/api/1.0
+
+FAIL=false
+
+# Check if we have an API key
+if [ -z "$API_KEY" ]; then
+  echo "ERROR: the apikey was not specified"
+  FAIL=true
+fi
+
+# Check if we have a domain.
+if [ -z "$SERVER" ]; then
+  echo "ERROR: no server name was specified"
+  FAIL=true
+fi
+
+# Check if we have a username
+if [ -z "$USERNAME" ]; then
+  echo "ERROR: the username was not specified"
+  FAIL=true
+fi
+
+# Show help and exit if either parameter is not provided.
+if [ "$FAIL" = true ]; then
+  show_help
+  exit 1
+fi
+
+# write our apikey to a file for http headers and we will use that for authentication
+headers=$(mktemp)
+echo "L2LAUTH:$API_KEY" >> "${headers}"
+
+echoerr() {
+    echo "${1}" 1>&2
+}
+
+_dbg() {
+    if [ ${VERBOSE} = true ]; then
+        echoerr "$@"
+    fi
+}
+
+_log() {
+    echoerr "$@"
+}
+
+_curl() {
+    jsonstr=$(curl -H @"${headers}" --silent --show-error "$@")
+    _dbg "${1} -> ${jsonstr}"
+    echo "${jsonstr}"
+}
+
+_curlpost() {
+    jsonstr=$(curl -X POST -H @"${headers}" --silent --show-error "$@")
+    _dbg "${1} -> ${jsonstr}"
+    echo "${jsonstr}"
+}
+
+_getdata() {
+    DATA=$(echo "${1}" | jq -r '.data')
+    echo "${DATA}"
+}
+
+_checkdata_err() {
+    DATA=$(echo "${1}" | jq -r '.data')
+    DATA_LENGTH=$(echo "${DATA}" | jq -r 'length')
+    if [ "${DATA_LENGTH}" -eq 0 ]; then
+        echoerr "No data returned for ${2}"
+        exit 1
+    fi
+
+    echo "${DATA}"
+}
+
+###################################################################################################################
+# This shows how to use the API to look up information about a Site. For this application, the specified site must
+# be a test site so that we can avoid any accidents with production data. For production code, you don't need to do
+# this kind of check as you'll need to work against production sites.
+#
+# Note that we are using a function to check the api results - API calls can fail for a variety of reasons and
+# your code should make sure to check the results.  Also, API calls that read data should always use an HTTP GET
+# operation.
+#
+# This shows an example of asking the api to list all Sites that are active, are a test site, and have the
+# specified site id using filter parameters in the query args. There must be only one item in the result list.
+# resp = requests.get(baseurl + 'sites/', dcu(args, {'test_site': True, 'site': site, 'active': True}))
+JSON=$(_curl "${BASE_URL}/sites/?test_site=True&site=${SITE}&active=True")
+DATA=$(_checkdata_err "${JSON}" "Site")
+SITEOBJ=$(echo "${DATA}" | jq -r '.[0]')
+SITEOBJ_DESC=$(echo "${SITEOBJ}" | jq -r '.description')
+SITEOBJ_SITE=$(echo "${SITEOBJ}" | jq -r '.site')
+_log "Using site: ${SITEOBJ_DESC} (site: ${SITEOBJ_SITE})"
+
+###################################################################################################################
+# Now let's find an area/line/machine to use.
+# Let's grab the last area in the list - this shows how we can page through the data returned by the api calls,
+# as you can never assume that all the data will fit in one request. Check the API documentation for the default
+# limit.
+LIMIT=2
+OFFSET=0
+FINISHED=false
+while ! ${FINISHED}; do
+    JSON=$(_curl "${BASE_URL}/areas/?limit=${LIMIT}&offset=${OFFSET}&active=True&site=${SITE}")
+    DATA=$(_getdata "${JSON}")
+    DATA_LENGTH=$(echo "${DATA}" | jq -r 'length')
+
+    if [ "$DATA_LENGTH" -eq 0 ]; then
+        OBJ=${LAST_DATA}
+        FINISHED=true
+    elif [ "$DATA_LENGTH" -lt $LIMIT ]; then
+        OBJ=$(echo "${DATA}" | jq -r '.[-1]')
+        FINISHED=true
+    else
+        LAST_DATA=$(echo "${DATA}" | jq -r '.[-1]')
+        OFFSET=$((OFFSET + DATA_LENGTH))
+    fi
+done
+
+AREA_DESC=$(echo "${OBJ}" | jq -r '.description')
+AREA_CODE=$(echo "${OBJ}" | jq -r '.code')
+AREA_ID=$(echo "${OBJ}" | jq -r '.id')
+_log "Using Area: ${AREA_DESC} - ${AREA_CODE} (${AREA_ID})"
+
+# grab a line in the area we've found that supports production
+JSON=$(_curl "${BASE_URL}/lines/?active=True&area_id=${AREA_ID}&enable_production=true")
+DATA=$(_checkdata_err "${JSON}" "Line")
+LINEOBJ=$(echo "${DATA}" | jq -r '.[0]')
+LINE_DESC=$(echo "${LINEOBJ}" | jq -r '.description')
+LINE_CODE=$(echo "${LINEOBJ}" | jq -r '.code')
+LINE_ID=$(echo "${LINEOBJ}" | jq -r '.id')
+_log "Using Line: ${LINE_DESC} - ${LINE_CODE} (${LINE_ID})"
+
+# grab a machine on the line
+JSON=$(_curl "${BASE_URL}/machines/?active=True&line_id=${LINE_ID}")
+DATA=$(_checkdata_err "${JSON}" "Machine")
+MACHOBJ=$(echo "${DATA}" | jq -r '.[0]')
+MACHINE_DESC=$(echo "${MACHOBJ}" | jq -r '.description')
+MACHINE_CODE=$(echo "${MACHOBJ}" | jq -r '.code')
+MACHINE_ID=$(echo "${MACHOBJ}" | jq -r '.id')
+_log "Using Machine: ${MACHINE_DESC} - ${MACHINE_CODE} (${MACHINE_ID})"
+
+# grab a Dispatch Type we can use
+JSON=$(_curl "${BASE_URL}/dispatchtypes/?active=True&site=${SITE}")
+DATA=$(_checkdata_err "${JSON}" "Dispatch Type")
+DTOBJ=$(echo "${DATA}" | jq -r '.[0]')
+DISPATCH_TYPE_DESC=$(echo "${DTOBJ}" | jq -r '.description')
+DISPATCH_TYPE_ID=$(echo "${DTOBJ}" | jq -r '.id')
+DISPATCH_TYPE_CODE=$(echo "${DTOBJ}" | jq -r '.code')
+_log "Using Dispatch Type: ${DISPATCH_TYPE_DESC}"
+
+###################################################################################################################
+# Let's record a user clocking in to Dispatch to work on our line we found previously.
+# resp = requests.post(baseurl + f'users/clock_in/{testuser}/', dcu(args, {'linecode': line_data['code']}))
+JSON=$(_curlpost "${BASE_URL}/users/clock_in/${USERNAME}/" -d site="${SITE}" -d linecode="${LINE_CODE}")
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "User ${USERNAME} clocked in successfully."
+else
+    _log "User ${USERNAME} was not clocked in."
+fi
+
+# Now clock them out
+JSON=$(_curlpost "${BASE_URL}/users/clock_out/${USERNAME}/" -d site="${SITE}")
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "User ${USERNAME} clocked out successfully."
+else
+    _log "User ${USERNAME} was not clocked out."
+fi
+
+# We can record a user clockin session in the past by supplying a start and an end parameter. These datetime
+# parameters in the API must be formatted consistently, and must represent the current time in the Site's
+# timezone (NOT UTC) unless otherwise noted in the API documentation.
+START=$(date --date="7 hours ago" +"%Y-%m-%d %H:%M") # Get the date 7 hours ago.
+END=$(date --date="1 hour ago" +"%Y-%m-%d %H:%M")   # Get the date 1 hour ago.
+JSON=$(_curlpost "${BASE_URL}/users/clock_in/${USERNAME}/" -d site="${SITE}" -d linecode="${LINE_CODE}" -d start="${START}" -d end="${END}")
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "User ${USERNAME} back dated clock in was successful."
+else
+    _log "User ${USERNAME} back dated clock in failed."
+fi
+
+###################################################################################################################
+# Let's call specific api's for the machine we found. Here we set the machine's cycle count, and then
+# we increment the machine's cycle count.
+JSON=$(_curlpost "${BASE_URL}/machines/set_cycle_count/" -d code="${MACHINE_CODE}" -d site="${SITE}" -d cyclecount=123)
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "Cycle count set successfully."
+else
+    _log "Unable to set cycle count."
+fi
+
+# this simulates a high frequency machine where we make so many calls to this we don't care about tracking the
+# lastupdated values for the machine cycle count.
+JSON=$(_curlpost "${BASE_URL}/machines/increment_cycle_count/" -d code="${MACHINE_CODE}" -d site="${SITE}" -d cyclecount=123 -d skip_lastupdated=1)
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "Cycle count incremented successfully."
+else
+    _log "Unable to increment cycle count."
+fi
+
+###################################################################################################################
+# Let's create a Dispatch for the machine, to simulate an event that requires intervention
+echo "trying dispatches/open"
+JSON=$(_curlpost "${BASE_URL}/dispatches/open/" -d site="${SITE}" -d machine="${MACHINE_ID}" -d description="l2lsdk test dispatch" -d dispatchtype="${DISPATCH_TYPE_ID}")
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "Dispatch created successfully."
+else
+    errmsg=$(echo "${JSON}" | jq -r '.error')
+    _log "Unable to create Dispatch: ${errmsg}"
+fi
+DISPATCH_ID=$(echo "${JSON}" | jq -r '.data | .id')
+
+# Now let's close it
+JSON=$(_curlpost "${BASE_URL}/dispatches/close/${DISPATCH_ID}/")
+if [ "$SUCCESS" = true ]; then
+    _log "Dispatch closed successfully."
+else
+    errmsg=$(echo "${JSON}" | jq -r '.error')
+    _log "Unable to close Dispatch: ${errmsg}"
+fi
+
+###################################################################################################################
+# Let's add a Dispatch for the machine that represents an event that already happened and we just want to record it
+START=$(date --date="7 hours ago" +"%Y-%m-%d %H:%M")
+END=$(date --date="1 hour ago" +"%Y-%m-%d %H:%M")
+JSON=$(_curlpost "${BASE_URL}/dispatches/add/" -d site="${SITE}" -d machinecode="${MACHINE_CODE}" -d description="l2lsdk test dispatch" -d dispatchtypecode="${DISPATCH_TYPE_CODE}" -d reported="${START}" -d completed="${END}")
+SUCCESS=$(echo "${JSON}" | jq -r '.success')
+if [ "$SUCCESS" = true ]; then
+    _log "Created backdated Dispatch."
+else
+    errmsg=$(echo "${JSON}" | jq -r '.error')
+    _log "Unable to create backdated Dispatch: ${errmsg}"
+fi
+
+###################################################################################################################
+# Let's record some production data using the record_details api. This will create a 1 second pitch as we use now
+# both start and end. Typically you should use a real time range for the start and end values.
+######################################################################################################################
+JSON=$(_curlpost "${BASE_URL}/pitchdetails/record_details/" -d site="${SITE}" -d linecode="${LINE_CODE}" -d productcode="testproduct-000" -d actual=100 -d scrap=3 -d operator_count=1 -d start="now" -d end="now")
+if [ "$SUCCESS" = true ]; then
+    _log "Production data submitted successfully."
+else
+    errmsg=$(echo "${JSON}" | jq -r '.error')
+    _log "Unable to submit production data: ${errmsg}"
+fi
+
+# Let's get the production reporting data for our line
+START=$(date --date="1 day ago" +"%Y-%m-%d %H:%M")
+START=$(date +"%Y-%m-%d 00:00")
+END=$(date --date="tomorrow" +"%Y-%m-%d %H:%M")
+JSON=$(_curlpost "${BASE_URL}/reporting/production/daily_summary_data_by_line/" -d site="${SITE}" -d linecode="${LINE_CODE}" -d start="${START}" -d end="${END}" -d show_production=true)
+_log "Production Reporting Data: ${JSON}"
+
+rm "${headers}"
